@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pandas
+langchain-openai
+langchain-pinecone
+langchain-text-splitters
+pinecone-client
+python-dotenv
