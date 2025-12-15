@@ -23,18 +23,18 @@ LLMOD_BASE_URL = "https://api.llmod.ai/v1"
 
 
 def process_data():
-    print(f"🚀 Starting ingestion. Test Mode: {TEST_MODE}")
+    print(f"Starting ingestion. Test Mode: {TEST_MODE}")
 
     # 1. Load Data
     if not os.path.exists("ted_talks_en.csv"):
-        print("❌ Error: ted_talks_en.csv not found.")
+        print("Error: ted_talks_en.csv not found.")
         return
 
     df = pd.read_csv("ted_talks_en.csv")
 
     if TEST_MODE:
         df = df.head(TEST_LIMIT)
-        print(f"⚠️ TEST MODE: Only processing first {TEST_LIMIT} rows.")
+        print(f"⚠TEST MODE: Only processing first {TEST_LIMIT} rows.")
 
     documents = []
 
@@ -72,14 +72,14 @@ def process_data():
                 {"page_content": chunk, "metadata": doc["metadata"]}
             )
 
-    print(f"🧩 Created {len(final_docs)} chunks.")
+    print(f"Created {len(final_docs)} chunks.")
 
     # 4. Initialize Pinecone
     pc = Pinecone(api_key=os.environ.get("PINECONE_API_KEY"))
 
     existing_indexes = [i.name for i in pc.list_indexes()]
     if INDEX_NAME not in existing_indexes:
-        print(f"📦 Creating Pinecone index: {INDEX_NAME}")
+        print(f"Creating Pinecone index: {INDEX_NAME}")
         pc.create_index(
             name=INDEX_NAME,
             dimension=1536,
@@ -98,13 +98,13 @@ def process_data():
     from langchain_core.documents import Document
     lc_docs = [Document(page_content=d["page_content"], metadata=d["metadata"]) for d in final_docs]
 
-    print("📤 Uploading vectors...")
+    print("Uploading vectors...")
     PineconeVectorStore.from_documents(
         documents=lc_docs,
         embedding=embeddings,
         index_name=INDEX_NAME
     )
-    print("🎉 Ingestion Complete!")
+    print("Ingestion Complete!")
 
 
 if __name__ == "__main__":

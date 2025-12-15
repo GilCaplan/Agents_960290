@@ -13,7 +13,7 @@ load_dotenv()
 # --- CONFIGURATION ---
 CHUNK_SIZE = 1024
 OVERLAP_RATIO = 0.2
-TOP_K = 5
+TOP_K = 3
 
 # Custom Model Config
 EMBEDDING_MODEL = "RPRTHPB-text-embedding-3-small"
@@ -23,15 +23,15 @@ INDEX_NAME = "ted-rag-index"
 
 app = FastAPI()
 
-# --- CLIENT INITIALIZATION ---
-# 1. Embeddings (for query)
+#  CLIENT INITIALIZATION
+# Embeddings (for query)
 embeddings = OpenAIEmbeddings(
     model=EMBEDDING_MODEL,
     api_key=os.environ.get("LLMOD_API_KEY"),
     base_url=LLMOD_BASE_URL
 )
 
-# 2. Vector Store (Read-only connection)
+# vector Store (Read-only connection)
 pc = Pinecone(api_key=os.environ.get("PINECONE_API_KEY"))
 vector_store = PineconeVectorStore.from_existing_index(
     index_name=INDEX_NAME,
@@ -46,7 +46,7 @@ llm = ChatOpenAI(
     base_url=LLMOD_BASE_URL
 )
 
-# --- SYSTEM PROMPT ---
+#  SYSTEM PROMPT
 SYSTEM_PROMPT_TEXT = """You are a TED Talk assistant that answers questions strictly and 
 only based on the TED dataset context provided to you (metadata 
 and transcript passages).
@@ -63,7 +63,7 @@ You may add additional clarifications (e.g., response style), but you must
 keep the above constraints."""
 
 
-# --- DATA MODELS ---
+#  DATA MODELS
 class PromptRequest(BaseModel):
     question: str
 
@@ -86,7 +86,7 @@ class PromptResponse(BaseModel):
     Augmented_prompt: AugmentedPrompt
 
 
-# --- ENDPOINTS ---
+#  ENDPOINTS
 
 @app.post("/api/prompt", response_model=PromptResponse)
 async def prompt_endpoint(request: PromptRequest):
