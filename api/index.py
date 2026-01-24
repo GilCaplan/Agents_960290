@@ -13,7 +13,7 @@ load_dotenv()
 # --- CONFIGURATION ---
 CHUNK_SIZE = 1024
 OVERLAP_RATIO = 0.2
-TOP_K = 3
+TOP_K = 5
 
 # Custom Model Config
 EMBEDDING_MODEL = "RPRTHPB-text-embedding-3-small"
