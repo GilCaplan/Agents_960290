@@ -155,13 +155,13 @@ def _init_services():
         )
 
         # Separate lightweight LLM for MultiQueryRetriever sub-query generation.
-        # temperature=0 → deterministic/fast; streaming=False → no overhead.
+        # streaming=False → no overhead. temperature=1 required by this model endpoint.
         # Swap model name here for a cheaper/smaller model if available on the endpoint.
         retriever_llm = ChatOpenAI(
             api_key=os.getenv("LLMOD_API_KEY"),
             base_url=os.getenv("LLMOD_API_BASE", "https://api.llmod.ai/v1"),
             model="RPRTHPB-gpt-5-mini",
-            temperature=0,
+            temperature=1,
             streaming=False
         )
 
@@ -199,11 +199,11 @@ def _init_services():
         ]
 
         prompt = ChatPromptTemplate.from_messages([
-            ("system", f"""אתה אגרונום מומחה וידידותי בישראל.
-    1. בשיחות חולין: ענה בנימוס ואל תשתמש בכלים.
-    2. בשאלות מקצועיות: חובה להשתמש בכלי 'weather_lookup'.
+            ("system", f"""אתה אגרונום מומחה בישראל. אתה עונה אך ורק על שאלות הקשורות לחקלאות, גידולים, קרקע, השקיה, מזג אוויר חקלאי, מחלות צמחים וניהול שדות.
+    1. אם השאלה אינה קשורה לחקלאות — ענה בנימוס בעברית שאינך יכול לסייע בנושא זה, והפנה את המשתמש לפנות למומחה מתאים. אל תשתמש בכלים ואל תרחיב.
+    2. בשאלות מקצועיות הקשורות למזג אוויר: חובה להשתמש בכלי 'weather_lookup'.
     3. ההקשר הנסתר שמועבר אליך מכיל את התאריך ("היום") והמיקום.
-    4. חובה להשתמש בכלי 'agri_knowledge_base' לשאלות על גידולים. אם הכלי מחזיר NO RESULTS, נסה בדיוק פעם אחת נוספת עם מילות מפתח שונות ורחבות יותר — לאחר הניסיון השני, המשך עם המידע הזמין.
+    4. חובה להשתמש בכלי 'agri_knowledge_base' לכל שאלה חקלאית. בסס את תשובתך אך ורק על המידע שמוחזר מהכלי — אל תוסיף ידע כללי שאינו מהמקורות. אם הכלי מחזיר NO RESULTS, נסה בדיוק פעם אחת נוספת עם מילות מפתח שונות ורחבות יותר — לאחר הניסיון השני, ציין שלא נמצא מידע רלוונטי במאגר.
     5. ענה בעברית בלבד ובצורה מקצועית.
     6. {SAFETY_INSTRUCTIONS}"""),
             MessagesPlaceholder(variable_name="chat_history"),
