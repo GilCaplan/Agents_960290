@@ -23,15 +23,41 @@ An AI-powered agricultural advisory agent for Israeli farmers, built with LangCh
 
 ---
 
+## Efficiency Design — Strengths & Tradeoffs
+
+The implementation addresses the three efficiency requirements: avoiding unnecessary LLM calls, minimising prompt/context size, and staying within budget.
+
+### LLM Call Efficiency
+
+| Decision | Strength | Tradeoff |
+|---|---|---|
+| **Dedicated `retriever_llm`** for `MultiQueryRetriever` | Isolated from the main agent LLM; `temperature=0`, `streaming=False` — deterministic and fast, no token-streaming overhead. Swappable to a cheaper model independently. | `MultiQueryRetriever` still makes one extra LLM call per RAG search to generate sub-queries; the benefit is significantly better recall over a single-query retriever. |
+| **Casual chat skips all tools** | The system prompt instructs the agent not to call any tool for non-agricultural chitchat, saving 1–2 LLM tool calls per casual message. | None — correct by design. |
+| **Retry capped at exactly 1** | If `agri_knowledge_base` returns no results, the agent tries once more with different keywords, then proceeds. Prevents unbounded retry loops. | One retry adds a round-trip in edge cases, but guarantees a response and better coverage than zero retries. |
+| **Lazy Pinecone indexing** | PDFs are only indexed if the index is empty; all subsequent restarts skip this entirely — no wasted embedding calls. | None. |
+
+### Context / Prompt Size Efficiency
+
+| Decision | Strength | Tradeoff |
+|---|---|---|
+| **Chat history window: first 4 + last 4 messages** | Hard cap of 8 messages passed to the LLM regardless of conversation length. Preserves topic context (first 2 turns) and recency (last 2 turns) while bounding token cost. | Messages in the middle of a long conversation are dropped. Acceptable for most agricultural Q&A flows where context resets per topic. |
+| **Weather output: today + 7-day + 30-day summaries** | Historical climate context is agriculturally necessary — planting, irrigation, and pest decisions depend on recent weather trends, not just today's readings. Always included. | Adds ~30 lines to the agent scratchpad. Justified because the information is directly relevant to every professional query. |
+| **RAG chunks labelled as authoritative reference** | Wrapping chunks in `=== AGRICULTURAL KNOWLEDGE BASE — AUTHORITATIVE REFERENCE MATERIAL ===` signals to the LLM what the block is and how to weight it, improving answer quality without extra calls. | Adds a single header line per tool call — negligible cost. |
+| **Compact system prompt (6 rules)** | System prompt is intentionally short. Rules cover tool usage, language, retry behaviour, and security without verbose prose. | — |
+| **`SAFETY_INSTRUCTIONS` variable** | Prompt injection and role-break attempts are rejected in Hebrew, keeping the agent in character. Defined once as a module constant, reused in the prompt. | Adds ~3 lines to the system prompt — a deliberate, minimal cost for robustness. |
+| **Weather data cached per city** | Raw hourly JSON (~13–16 MB) is loaded and aggregated to one row per day once. All subsequent lookups for that city return in <2 ms with no file I/O. | Memory usage grows with number of cities queried in a session (bounded to 16 stations). |
+
+---
+
 ## Features Beyond Base Requirements
 
-- **Rich weather context** — the weather tool returns not just today's conditions but rolling 7-day and 30-day summaries (avg/max/min temperature, total rainfall, humidity, frost days), giving the agent historical context for long-term agricultural planning decisions.
-- **Smart weather caching** — on first query for a city, the full hourly JSON is loaded and aggregated down to one row per day (~1,800 rows). All subsequent queries for any date in that city return in under 2ms.
-- **Full weather columns** — all 16 measurement columns (TD, TDmax, TDmin, RH, Rain, WS, WSmax, WD, STDwd, etc.) are preserved and passed to the agent.
-- **Partial window handling** — if fewer than 7 or 30 days of history exist for a date, the system reports however many days are actually available.
-- **Background initialisation** — the server binds its port immediately on startup; Supabase, LLM, embeddings, and Pinecone connect in a background thread so the service is never slow to come up.
-- **Lazy Pinecone indexing** — PDFs are only indexed if the Pinecone index is empty; subsequent restarts skip indexing entirely, recommended to embedd pdf's locally to pinecone before loading website on (in our case) render.com.
-- **Multi-city weather coverage** — 16 Israeli weather stations, matched by fuzzy name lookup over the year of 2025.
+- **Rich weather context** — WeatherTool returns today's conditions plus rolling 7-day and 30-day summaries (avg/max/min temperature, total rainfall, humidity, frost days) for long-term agricultural planning.
+- **Smart weather caching** — first query for a city aggregates hourly → daily (~1,800 rows); all subsequent queries for any date in that city return in <2 ms.
+- **Background initialisation** — port binds immediately on startup; Supabase, LLM, embeddings, and Pinecone connect in a background thread.
+- **Lazy Pinecone indexing** — PDFs are indexed only if the Pinecone index is empty; subsequent restarts skip indexing entirely.
+- **Multi-city weather coverage** — 16 Israeli weather stations, matched by fuzzy name lookup.
+- **Architecture viewer in UI** — sidebar button fetches and displays the system architecture diagram inline.
+- **Streaming UI** — `/get-advice` endpoint streams tokens in real time; `/api/execute` returns full JSON with traced steps.
 
 ---
 
@@ -51,7 +77,7 @@ All PDFs are chunked (1,000 tokens, 200 overlap) and embedded with `BAAI/bge-sma
 
 ### Weather Data (`city_data/`) — 212 MB, 16 files
 
-Hourly meteorological readings from 16 Israeli weather stations, covering multiple years. Each file contains columns: `date`, `TD` (temperature), `TDmax`, `TDmin`, `RH` (humidity), `Rain`, `WS` (wind speed), `WSmax`, `WD` (wind direction), `STDwd`, and others.
+Hourly meteorological readings from 16 Israeli weather stations covering 2025. Columns: `date`, `TD`, `TDmax`, `TDmin`, `RH`, `Rain`, `WS`, `WSmax`, `WD`, `STDwd`, and others.
 
 | Station | Station |
 |---|---|
@@ -75,20 +101,22 @@ User message (prompt + city + date + optional chat_id)
 POST /api/execute  (FastAPI)
         │
         ├─ Retrieve chat history from Supabase (if chat_id)
+        │   └─ Window: first 4 + last 4 messages (≤8 total)
         │
         ▼
 LangChain AgentExecutor
         │
         ├─── AgentLLM decides which tools to call
         │
-        ├─── WeatherTool (if weather/climate question)
-        │         └─ Load city daily cache (<2ms if warm)
+        ├─── WeatherTool (weather/climate questions)
+        │         └─ City daily cache (<2ms if warm)
         │             Return: today + 7-day + 30-day summaries
         │
-        ├─── AgriKnowledgeBase (if agronomic question)
-        │         └─ MultiQueryRetriever → 3 sub-queries via LLM
+        ├─── AgriKnowledgeBase (agronomic questions)
+        │         └─ retriever_llm (temp=0) generates 3 sub-queries
         │             → Pinecone vector search (k=3 each)
-        │             → Return top relevant PDF chunks
+        │             → Return chunks labelled as authoritative reference
+        │             → Retry once with different keywords if no results
         │
         └─── AgentLLM synthesises final Hebrew response
                 │
@@ -116,12 +144,10 @@ LangChain AgentExecutor
 ### Prerequisites
 - [Render](https://render.com) account
 - [Supabase](https://supabase.com) project with the tables below
-- [Pinecone](https://pinecone.io) project with a `agri-advisor` index (dimension 384, cosine)
+- [Pinecone](https://pinecone.io) project with an `agri-advisor` index (dimension 384, cosine)
 - An OpenAI-compatible LLM API key (project uses [llmod.ai](https://llmod.ai))
 
 ### 1. Supabase tables
-
-Run in the Supabase SQL Editor:
 
 ```sql
 CREATE TABLE IF NOT EXISTS chats (
@@ -142,7 +168,7 @@ ALTER TABLE messages DISABLE ROW LEVEL SECURITY;
 ### 2. Render web service
 
 1. Create a new **Web Service** and connect this repository.
-2. Set the following environment variables in the Render dashboard:
+2. Set environment variables in the Render dashboard:
 
 | Variable | Value |
 |---|---|
@@ -153,19 +179,14 @@ ALTER TABLE messages DISABLE ROW LEVEL SECURITY;
 | `PINECONE_API_KEY` | Your Pinecone API key |
 | `PINECONE_INDEX_NAME` | `agri-advisor` |
 
-3. Render will use `render.yaml` automatically — no further configuration needed.
-4. On first deploy, the service will index all PDFs into Pinecone (one-time, ~2–5 minutes). Subsequent deploys skip this step.
+3. Render will use `render.yaml` automatically.
+4. On first deploy, PDFs are indexed into Pinecone (one-time, ~2–5 minutes). Subsequent deploys skip this.
 
 ### 3. Populate Pinecone locally (recommended)
 
-To avoid the first-deploy indexing load on the free tier, index locally before deploying:
-
 ```bash
 pip install -r requirements.txt
-# set env vars in .env, then:
-python - <<'EOF'
-# run the indexing block from main.py build_index() with your local .env
-EOF
+# set env vars in .env, then run build_index() from main.py
 ```
 
-Or simply deploy and wait — the agent responds normally while indexing runs in the background.
+Or deploy and wait — the agent responds normally while indexing runs in the background.

@@ -21,6 +21,15 @@
         .new-chat-btn:hover { filter: brightness(1.1); }
         .logout-btn { background: rgba(239,68,68,0.1); color: #fca5a5; border: 1px solid rgba(239,68,68,0.3); padding: 9px; border-radius: 6px; cursor: pointer; font-weight: 600; font-family: inherit; transition: 0.2s; margin-top: 12px; width: 100%; }
         .logout-btn:hover { background: var(--danger); color: white; }
+        .arch-btn { background: rgba(255,255,255,0.07); color: #d1d5db; border: 1px solid rgba(255,255,255,0.15); padding: 9px; border-radius: 6px; cursor: pointer; font-weight: 600; font-family: inherit; transition: 0.2s; margin-top: 8px; width: 100%; }
+        .arch-btn:hover { background: rgba(255,255,255,0.14); color: white; }
+
+        /* Architecture modal */
+        #arch-modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.8); z-index: 2000; align-items: center; justify-content: center; }
+        #arch-modal.open { display: flex; }
+        #arch-modal .arch-box { background: white; border-radius: 12px; padding: 16px; max-width: 90vw; max-height: 90vh; overflow: auto; position: relative; }
+        #arch-modal .arch-close { position: absolute; top: 10px; left: 10px; background: #374151; color: white; border: none; border-radius: 6px; padding: 4px 10px; cursor: pointer; font-size: 0.85rem; font-family: inherit; }
+        #arch-modal img { display: block; max-width: 100%; height: auto; }
         .chat-list { flex-grow: 1; overflow-y: auto; }
         .chat-item-container { display: flex; justify-content: space-between; align-items: center; padding: 9px; margin-bottom: 4px; border-radius: 4px; cursor: pointer; background: rgba(255,255,255,0.05); font-size: 0.82rem; transition: 0.2s; }
         .chat-item-container:hover { background: rgba(255,255,255,0.1); }
@@ -79,7 +88,16 @@
     <button class="new-chat-btn" onclick="createNewChat()">+ שיחה חדשה</button>
     <div class="chat-list" id="chat-list"></div>
     <div id="user-display" style="font-size:0.82rem;opacity:0.7;text-align:center;margin-top:8px;"></div>
+    <button class="arch-btn" onclick="showArchitecture()">🏗️ ארכיטקטורה</button>
     <button class="logout-btn" onclick="logout()">🚪 התנתק</button>
+</div>
+
+<!-- Architecture modal -->
+<div id="arch-modal" onclick="closeArchModal(event)">
+    <div class="arch-box">
+        <button class="arch-close" onclick="document.getElementById('arch-modal').classList.remove('open')">✕ סגור</button>
+        <img id="arch-img" src="" alt="System Architecture">
+    </div>
 </div>
 
 <div class="main-content">
@@ -320,6 +338,16 @@ function buildStepsHTML(steps) {
 
 function escapeHtml(str) {
     return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ── Architecture modal ─────────────────────────────────────────────────────
+function showArchitecture() {
+    document.getElementById('arch-img').src = '/api/model_architecture';
+    document.getElementById('arch-modal').classList.add('open');
+}
+function closeArchModal(e) {
+    if (e.target === document.getElementById('arch-modal'))
+        document.getElementById('arch-modal').classList.remove('open');
 }
 
 // ── Keyboard shortcut ──────────────────────────────────────────────────────
