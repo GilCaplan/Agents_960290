@@ -43,7 +43,7 @@ The implementation addresses the three efficiency requirements: avoiding unneces
 | **Chat history window: first 4 + last 4 messages** | Hard cap of 8 messages passed to the LLM regardless of conversation length. Preserves topic context (first 2 turns) and recency (last 2 turns) while bounding token cost. | Messages in the middle of a long conversation are dropped. Acceptable for most agricultural Q&A flows where context resets per topic. |
 | **Weather output: today + 7-day + 30-day summaries** | Historical climate context is agriculturally necessary — planting, irrigation, and pest decisions depend on recent weather trends, not just today's readings. Always included. | Adds ~30 lines to the agent scratchpad. Justified because the information is directly relevant to every professional query. |
 | **RAG chunks labelled as authoritative reference** | Wrapping chunks in `=== AGRICULTURAL KNOWLEDGE BASE — AUTHORITATIVE REFERENCE MATERIAL ===` signals to the LLM what the block is and how to weight it, improving answer quality without extra calls. | Adds a single header line per tool call — negligible cost. |
-| **Compact system prompt (6 rules)** | System prompt is intentionally short. Rules cover tool usage, language, retry behaviour, and security without verbose prose. | — |
+| **Compact system prompt (8 rules)** | System prompt is intentionally short. Rules cover tool usage, language, retry behaviour, jargon explanation, response-length calibration, location assumptions, and security without verbose prose. | — |
 | **`SAFETY_INSTRUCTIONS` variable** | Prompt injection and role-break attempts are rejected in Hebrew, keeping the agent in character. Defined once as a module constant, reused in the prompt. | Adds ~3 lines to the system prompt — a deliberate, minimal cost for robustness. |
 | **Weather data cached per city** | Raw hourly JSON (~13–16 MB) is loaded and aggregated to one row per day once. All subsequent lookups for that city return in <2 ms with no file I/O. | Memory usage grows with number of cities queried in a session (bounded to 16 stations). |
 
@@ -55,7 +55,7 @@ The implementation addresses the three efficiency requirements: avoiding unneces
 - **Smart weather caching** — first query for a city aggregates hourly → daily (~1,800 rows); all subsequent queries for any date in that city return in <2 ms.
 - **Background initialisation** — port binds immediately on startup; Supabase, LLM, embeddings, and Pinecone connect in a background thread.
 - **Lazy Pinecone indexing** — PDFs are indexed only if the Pinecone index is empty; subsequent restarts skip indexing entirely.
-- **Multi-city weather coverage** — 16 Israeli weather stations, matched by fuzzy name lookup.
+- **Multi-city weather coverage** — 16 Israeli weather stations, matched by a deterministic Hebrew/English alias map with sorted fallback.
 - **Architecture viewer in UI** — sidebar button fetches and displays the system architecture diagram inline.
 - **Streaming UI** — `/get-advice` endpoint streams tokens in real time; `/api/execute` returns full JSON with traced steps.
 
