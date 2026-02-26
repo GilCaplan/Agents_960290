@@ -80,7 +80,7 @@ box(ax, 7.5, 6.0, 2.8, 1.3, "WeatherTool",
     C_TOOL, 9)
 
 box(ax, 7.5, 4.2, 2.8, 1.5, "AgriKnowledgeBase",
-    "MultiQueryRetriever\nRAG over PDF manuals\nSelf-correction prompt",
+    "MultiQueryRetriever\nretriever_llm (temp=0)\nRAG over PDF manuals",
     C_TOOL, 9)
 
 # ── Databases ────────────────────────────────────────────────────────────────
@@ -89,7 +89,7 @@ box(ax, 11.2, 6.0, 2.4, 1.3, "Supabase\n(PostgreSQL)",
     C_DB, 9)
 
 box(ax, 11.2, 4.2, 2.4, 1.5, "Pinecone\n(Vector DB)",
-    "PDF chunk embeddings\nall-MiniLM-L6-v2",
+    "PDF chunk embeddings\nBAAI/bge-small-en-v1.5",
     C_VEC, 9)
 
 # ── Arrows ───────────────────────────────────────────────────────────────────
