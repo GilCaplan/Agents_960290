@@ -141,7 +141,7 @@ def _init_services():
             api_key=os.getenv("LLMOD_API_KEY"),
             base_url=os.getenv("LLMOD_API_BASE", "https://api.llmod.ai/v1"),
             model="RPRTHPB-gpt-5-mini",
-            temperature=0.7,
+            temperature=1,
             streaming=True
         )
 
