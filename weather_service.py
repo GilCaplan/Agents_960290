@@ -106,18 +106,86 @@ class WeatherService:
 
         user_query = city.lower().strip()
 
-        # Match city to available files
-        matched_key = None
-        for file_key in self._available:
-            clean = file_key.replace("_", " ")
-            if user_query == clean or clean in user_query or user_query in clean:
-                matched_key = file_key
-                break
-        if matched_key is None and self._available:
-            matched_key = next(iter(self._available))
+        # Hebrew and common-variant aliases → canonical file key
+        CITY_ALIASES = {
+            # Eilat
+            "אילת": "eilat",
+            # Ariel
+            "אריאל": "ariel",
+            # Beer Sheva
+            "באר שבע": "beer_sheva",
+            "beer sheva": "beer_sheva",
+            "beersheba": "beer_sheva",
+            "be'er sheva": "beer_sheva",
+            # Ashdod
+            "אשדוד": "ashdod",
+            # Ashkelon
+            "אשקלון": "ashkelon",
+            # Hadera
+            "חדרה": "hadera",
+            # Haifa Technion
+            "חיפה": "haifa_technion",
+            "חיפה טכניון": "haifa_technion",
+            "haifa": "haifa_technion",
+            "haifa technion": "haifa_technion",
+            # Haifa Bate Zakuk
+            "חיפה בתי זיקוק": "haifa_bate_zakuk",
+            "haifa bate zakuk": "haifa_bate_zakuk",
+            # Jerusalem
+            "ירושלים": "jerusalem_center",
+            "ירושלים מרכז": "jerusalem_center",
+            "jerusalem": "jerusalem_center",
+            "jerusalem center": "jerusalem_center",
+            # Nitzan
+            "ניצן": "nitzan",
+            # Yotvata
+            "יוטבתה": "yotvata",
+            "יטבתה": "yotvata",
+            # Avne Eitan
+            "אבני איתן": "avne_eitan",
+            "avne eitan": "avne_eitan",
+            # Lev Kineret
+            "לב כנרת": "lev_kineret",
+            "כנרת": "lev_kineret",
+            "lev kineret": "lev_kineret",
+            "kineret": "lev_kineret",
+            # Maale Gilboa
+            "מעלה גלבוע": "maale_gilboa",
+            "גלבוע": "maale_gilboa",
+            "maale gilboa": "maale_gilboa",
+            # Tel Aviv Beach
+            "תל אביב": "tlv_beach",
+            "חוף תל אביב": "tlv_beach",
+            "tel aviv": "tlv_beach",
+            "tlv": "tlv_beach",
+            "tlv beach": "tlv_beach",
+            # Zichron Yaakov
+            "זכרון יעקב": "zichron_yaakov",
+            "זיכרון יעקב": "zichron_yaakov",
+            "zichron yaakov": "zichron_yaakov",
+            "zikhron yaakov": "zichron_yaakov",
+        }
+
+        # 1. Exact alias lookup (Hebrew or known variants)
+        matched_key = CITY_ALIASES.get(user_query)
+
+        # 2. Prefix/partial alias lookup (e.g. "חיפה טכניון" when query is "חיפה ...")
+        if matched_key is None:
+            for alias, key in CITY_ALIASES.items():
+                if alias in user_query or user_query in alias:
+                    matched_key = key
+                    break
+
+        # 3. Match against file keys (sorted for determinism)
+        if matched_key is None:
+            for file_key in sorted(self._available):
+                clean = file_key.replace("_", " ")
+                if user_query == clean or clean in user_query or user_query in clean:
+                    matched_key = file_key
+                    break
 
         if matched_key is None:
-            return "Error: No weather data available."
+            return f"Error: City '{city}' not found. Available cities: {', '.join(sorted(self._available))}"
 
         daily = self._get_daily(matched_key)
         if daily is None or daily.empty:
