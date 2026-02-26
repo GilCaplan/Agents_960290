@@ -147,7 +147,7 @@ function login() {
     document.getElementById('login-overlay').style.display = 'none';
     document.getElementById('user-display').innerText = `מחובר: ${currentUser}`;
     showWelcome();
-    loadUserChats();
+    loadUserChats(true);  // auto-load most recent chat on login
 }
 
 function logout() {
@@ -166,24 +166,30 @@ function showWelcome() {
         `<div class="message bot">👋 שלום <b>${currentUser}</b>! בחר מיקום ותאריך, ולחץ <b>"הרץ סוכן"</b> לקבלת ייעוץ חקלאי.</div>`;
 }
 
-async function loadUserChats() {
+async function loadUserChats(autoLoadFirst = false) {
     if (!currentUser) return;
-    const res  = await fetch(`/api/my-chats/${currentUser}`);
+    const res   = await fetch(`/api/my-chats/${currentUser}`);
     const chats = await res.json();
     const list  = document.getElementById('chat-list');
     list.innerHTML = "";
     chats.forEach(chat => {
         const div = document.createElement('div');
         div.className = `chat-item-container ${chat.chat_id === currentChatId ? 'active' : ''}`;
+        // click anywhere on the row (except the delete button) loads the chat
+        div.onclick = () => loadChatHistory(chat.chat_id, chat.title);
         div.innerHTML = `
-            <span style="flex-grow:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"
-                  onclick="loadChatHistory('${chat.chat_id}','${chat.title.replace(/'/g,"\\'")}')">
+            <span style="flex-grow:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
                 ${chat.title}
             </span>
             <span style="color:var(--danger);margin-right:6px;flex-shrink:0;"
-                  onclick="deleteChat('${chat.chat_id}')">🗑️</span>`;
+                  onclick="event.stopPropagation(); deleteChat('${chat.chat_id}')">🗑️</span>`;
         list.appendChild(div);
     });
+    // On login, auto-load the most recent chat so history is immediately visible
+    if (autoLoadFirst && chats.length > 0 && !currentChatId) {
+        const latest = chats[chats.length - 1];
+        loadChatHistory(latest.chat_id, latest.title);
+    }
 }
 
 async function loadChatHistory(chatId, title) {
@@ -193,11 +199,15 @@ async function loadChatHistory(chatId, title) {
         document.getElementById('city-input').value  = parts[1];
         document.getElementById('target-date').value = parts[2];
     }
-    const res  = await fetch(`/api/chat-history/${chatId}`);
-    const hist = await res.json();
-    const win  = document.getElementById('chat-window');
-    win.innerHTML = "";
-    hist.forEach(msg => appendMsg(msg.content, msg.role === 'user' ? 'user' : 'bot'));
+    try {
+        const res  = await fetch(`/api/chat-history/${chatId}`);
+        const hist = await res.json();
+        const win  = document.getElementById('chat-window');
+        win.innerHTML = "";
+        hist.forEach(msg => appendMsg(msg.content, msg.role === 'user' ? 'user' : 'bot'));
+    } catch (e) {
+        console.error('Failed to load chat history:', e);
+    }
     loadUserChats();
 }
 
