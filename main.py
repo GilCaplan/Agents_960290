@@ -388,7 +388,7 @@ async def agent_info():
 @app.get("/api/team_info")
 async def team_info():
     return {
-        "group_batch_order_number": "3",
+        "group_batch_order_number": "3_7",
         "team_name": "עמית + רחלי + גיל",
         "students": [
             {"name": "Gil", "email": "gil.caplan@campus.technion.ac.il"},
