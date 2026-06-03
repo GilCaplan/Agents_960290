@@ -1,6 +1,23 @@
 # Agri-Advisor Pro
 
-An AI-powered agricultural advisory agent for Israeli farmers, built with LangChain, FastAPI, Pinecone, and Supabase. Deployed on Render.
+An AI-powered agricultural advisory agent for Israeli farmers, built with **LangChain** and **FastAPI**. Runs **fully locally** on [Ollama](https://ollama.com) — no external API keys required.
+
+> **Local-first rebuild.** The project originally used a hosted LLM (llmod.ai gpt-5-mini), Pinecone, and Supabase. It now runs entirely on local infrastructure: the LLM and embeddings are served by Ollama, the vector store is a local FAISS index, and chat history lives in a local SQLite file. This removes all API-key dependencies and the network round-trips that dominated response time.
+
+---
+
+## Local Stack
+
+| Component | Technology |
+|---|---|
+| LLM (agent + Hebrew→English query expansion) | Ollama — `llama3.1:8b` |
+| Embeddings | Ollama — `nomic-embed-text` (768-dim) |
+| Vector store | Local **FAISS** index (`faiss_nomic_index/`) |
+| Chat history | Local **SQLite** (`agri_advisor.db`) |
+| Web framework | FastAPI |
+| Agent | LangChain `create_openai_tools_agent` + `AgentExecutor` with two tools |
+
+All model names are overridable via environment variables: `OLLAMA_AGENT_MODEL`, `OLLAMA_RETRIEVER_MODEL`, `OLLAMA_EMBED_MODEL`, `OLLAMA_BASE_URL`.
 
 ---
 
@@ -10,60 +27,58 @@ An AI-powered agricultural advisory agent for Israeli farmers, built with LangCh
 |---|---|
 | FastAPI backend | `main.py` — serves all API endpoints |
 | LangChain AgentExecutor | `create_openai_tools_agent` with two tools |
-| Supabase (PostgreSQL) | Chat and message history persistence |
-| Pinecone vector DB | RAG over 13 agricultural PDFs (6,380 chunks) |
-| Deployed on Render | Live at `https://agents-960290.onrender.com` |
+| Chat / message persistence | Local SQLite (`db_service.py`) |
+| Vector DB (RAG) | Local FAISS over agricultural PDFs |
 | `GET /api/team_info` | Group info and student list |
 | `GET /api/agent_info` | Agent description, prompt template, worked examples |
 | `GET /api/model_architecture` | Architecture diagram (PNG) |
 | `POST /api/execute` | Main agent endpoint with steps logging |
 | Module names in steps | `AgentLLM`, `WeatherTool`, `AgriKnowledgeBase` |
-| Multi-turn conversation | `chat_id` parameter with Supabase history |
+| Multi-turn conversation | `chat_id` parameter with SQLite history |
 | Hebrew responses | System prompt and all agent output in Hebrew |
 
 ---
 
-## Efficiency Design — Strengths & Tradeoffs
+## What Was Improved (vs. the reviewed version)
 
-The implementation addresses the three efficiency requirements: avoiding unnecessary LLM calls, minimising prompt/context size, and staying within budget.
+The previous version had several issues that this rebuild addresses directly:
 
-### LLM Call Efficiency
+### 1. Be'er Sheva weather returned N/A for everything
+**Root cause:** the Be'er Sheva station only records **ground temperature (`TG`)** and barometric pressure — it never reports air temperature (`TD`), humidity, wind, or rain (verified: 0 of 18,185 readings). The old code only looked at `TD`, so every field showed N/A.
+**Fix (`weather_service.py`):** when air temperature is unavailable, the tool falls back to **ground temperature, clearly labelled as such**, and shows honest `N/A` only for sensors the station genuinely lacks (instead of a misleading `0.0 mm`).
 
-| Decision | Strength | Tradeoff |
-|---|---|---|
-| **Dedicated `retriever_llm`** for `MultiQueryRetriever` | Isolated from the main agent LLM; `temperature=0`, `streaming=False` — deterministic and fast, no token-streaming overhead. Swappable to a cheaper model independently. | `MultiQueryRetriever` still makes one extra LLM call per RAG search to generate sub-queries; the benefit is significantly better recall over a single-query retriever. |
-| **Casual chat skips all tools** | The system prompt instructs the agent not to call any tool for non-agricultural chitchat, saving 1–2 LLM tool calls per casual message. | None — correct by design. |
-| **Retry capped at exactly 1** | If `agri_knowledge_base` returns no results, the agent tries once more with different keywords, then proceeds. Prevents unbounded retry loops. | One retry adds a round-trip in edge cases, but guarantees a response and better coverage than zero retries. |
-| **Lazy Pinecone indexing** | PDFs are only indexed if the index is empty; all subsequent restarts skip this entirely — no wasted embedding calls. | None. |
+### 2. Knowledge-base retrieval returned metadata, not practical content
+**Root cause:** two problems compounded. (a) Hebrew queries were embedded with an **English-only** model (`bge-small-en-v1.5`), so a Hebrew question for "wheat sowing" retrieved unrelated chunks that merely contained the word "Israel" (water-law, desalination, finance). (b) Boilerplate chunks (book endorsements, tables of contents, author bios, reference lists) competed with real agronomic content.
+**Fix (`rag_service.py`):**
+- **Hebrew→English query expansion** — every question is expanded by the LLM into 3 English search queries before embedding, matching the language of the (English) source manuals. The original query is also searched as a safety net.
+- **Junk-chunk filter at index time** — front-matter / boilerplate is dropped (≈22% of chunks), so retrieval surfaces practical content.
+- **`nomic-embed-text` embeddings** via Ollama, replacing the hosted English-only model.
 
-### Context / Prompt Size Efficiency
+### RAG audit — additional retrieval fixes
 
-| Decision | Strength | Tradeoff |
-|---|---|---|
-| **Chat history window: first 4 + last 4 messages** | Hard cap of 8 messages passed to the LLM regardless of conversation length. Preserves topic context (first 2 turns) and recency (last 2 turns) while bounding token cost. | Messages in the middle of a long conversation are dropped. Acceptable for most agricultural Q&A flows where context resets per topic. |
-| **Weather output: today + 7-day + 30-day summaries** | Historical climate context is agriculturally necessary — planting, irrigation, and pest decisions depend on recent weather trends, not just today's readings. Always included. | Adds ~30 lines to the agent scratchpad. Justified because the information is directly relevant to every professional query. |
-| **RAG chunks labelled as authoritative reference** | Wrapping chunks in `=== AGRICULTURAL KNOWLEDGE BASE — AUTHORITATIVE REFERENCE MATERIAL ===` signals to the LLM what the block is and how to weight it, improving answer quality without extra calls. | Adds a single header line per tool call — negligible cost. |
-| **Compact system prompt (8 rules)** | System prompt is intentionally short. Rules cover tool usage, language, retry behaviour, jargon explanation, response-length calibration, location assumptions, and security without verbose prose. | — |
-| **`SAFETY_INSTRUCTIONS` variable** | Prompt injection and role-break attempts are rejected in Hebrew, keeping the agent in character. Defined once as a module constant, reused in the prompt. | Adds ~3 lines to the system prompt — a deliberate, minimal cost for robustness. |
-| **Weather data cached per city** | Raw hourly JSON (~13–16 MB) is loaded and aggregated to one row per day once. All subsequent lookups for that city return in <2 ms with no file I/O. | Memory usage grows with number of cities queried in a session (bounded to 16 stations). |
+A deeper audit of common RAG failure modes surfaced three more issues, all fixed:
 
----
+- **Missing embedding task prefixes.** `nomic-embed-text` is trained to require `search_document:` on indexed text and `search_query:` on queries; LangChain's `OllamaEmbeddings` does not add them. Adding them (`NomicPrefixedEmbeddings`) **dramatically tightened retrieval** — relevant-chunk L2 distances dropped from ~1.5 to ~0.33, with a clean gap between relevant (~0.3–0.5) and off-topic (~0.73+) results.
+- **Duplicate source content.** `source2.pdf` is a near-duplicate of the FAO guide `cc3338en.pdf` (same passages, e.g. the gypsum text). Identical chunks are now de-duplicated at index time so they don't occupy multiple retrieval slots.
+- **No relevance threshold.** Retrieval now drops chunks with L2 distance > 0.70, so sparse/irrelevant queries return *no results* instead of tangential text.
 
-## Features Beyond Base Requirements
+### Grounding — is it faithful?
 
-- **Rich weather context** — WeatherTool returns today's conditions plus rolling 7-day and 30-day summaries (avg/max/min temperature, total rainfall, humidity, frost days) for long-term agricultural planning.
-- **Smart weather caching** — first query for a city aggregates hourly → daily (~1,800 rows); all subsequent queries for any date in that city return in <2 ms.
-- **Background initialisation** — port binds immediately on startup; Supabase, LLM, embeddings, and Pinecone connect in a background thread.
-- **Lazy Pinecone indexing** — PDFs are indexed only if the Pinecone index is empty; subsequent restarts skip indexing entirely.
-- **Multi-city weather coverage** — 16 Israeli weather stations, matched by a deterministic Hebrew/English alias map with sorted fallback.
-- **Architecture viewer in UI** — sidebar button fetches and displays the system architecture diagram inline.
-- **Streaming UI** — `/get-advice` endpoint streams tokens in real time; `/api/execute` returns full JSON with traced steps.
+Verified directly: answers are **grounded in the retrieved chunks, not hallucinated**. For example, a specific figure like "gypsum (CaSO₄·2H₂O) 5 t/ha for correcting soil sodicity" traces verbatim to `cc3338en.pdf`. Caveats inherent to a local 8B model: (a) Hebrew phrasing is occasionally awkward or mistranslates a term (the underlying fact is still from the source); (b) retrieval precision isn't perfect — a broad query can pull a related-but-not-exact chunk (e.g. a general cover-crop list for a "nitrogen-fixing" question). Some sources (`cc3338en`, `source2`) are India-centric FAO guides, so a few recommendations (crop names, metric dosages) reflect that context rather than Israel specifically.
+
+### 3. Response times
+**Fix:** all LLM, embedding, and vector-search calls are now **local** — no llmod.ai / Pinecone network latency. The agent runs at `temperature=0` (deterministic tool use), answer length is capped (`num_predict`), the context window is bounded (`num_ctx`), tool-loop iterations are limited (`max_iterations=4`), RAG returns only the top 3 chunks, and the fast 3B model handles the short query-expansion step.
+
+Typical latency on a local M-series Mac: **weather questions ≈ 10–25 s; knowledge-base questions ≈ 60–90 s**. The remaining cost is inherent to generating a Hebrew answer with a local 8-billion-parameter model (the smaller, faster 3B model was tested but degenerates on Hebrew, so it is used only for the English expansion step). On a machine with a GPU, or by pointing `OLLAMA_*` env vars at a larger/faster served model, latency drops further with no code changes.
+
+### 4. Reliability safety net
+Small local models occasionally refuse to answer even after a tool returned valid data. `_repair_if_spurious_refusal` in `main.py` detects this and re-synthesises a grounded Hebrew answer directly from the collected tool data (the path the local model handles reliably). For weather/agriculture questions it will, if needed, gather the tool data deterministically — guaranteeing a grounded answer instead of a spurious "no information found".
 
 ---
 
 ## Knowledge Base Data
 
-### Agricultural PDFs (`project_sources/`) — 137 MB, 13 files
+### Agricultural PDFs (`project_sources/`) — 12 files
 
 | File | Subject |
 |---|---|
@@ -73,11 +88,11 @@ The implementation addresses the three efficiency requirements: avoiding unneces
 | `einboeck_source_1.pdf` | Mechanical weed control in field crops |
 | `source2.pdf` – `source12.pdf` | Additional agronomy sources (irrigation, diseases, soil, water management in Israel) |
 
-All PDFs are chunked (1,000 tokens, 200 overlap) and embedded with `BAAI/bge-small-en-v1.5` (384 dimensions) into Pinecone. **6,380 vectors** total.
+PDFs are chunked (900 tokens, 150 overlap), filtered for boilerplate, and embedded with `nomic-embed-text` (768 dimensions) into a local FAISS index — **4,486 vectors** after filtering.
 
-### Weather Data (`city_data/`) — 212 MB, 16 files
+### Weather Data (`city_data/`) — 16 files
 
-Hourly meteorological readings from 16 Israeli weather stations covering 2025. Columns: `date`, `TD`, `TDmax`, `TDmin`, `RH`, `Rain`, `WS`, `WSmax`, `WD`, `STDwd`, and others.
+Hourly meteorological readings from 16 Israeli weather stations covering 2025. Columns include `date`, `TD` (air temp), `TG` (ground temp), `RH`, `Rain`, `WS`, `WD`, and others. **Not every station reports every sensor** — Be'er Sheva, for example, only reports ground temperature and pressure.
 
 | Station | Station |
 |---|---|
@@ -100,93 +115,81 @@ User message (prompt + city + date + optional chat_id)
         ▼
 POST /api/execute  (FastAPI)
         │
-        ├─ Retrieve chat history from Supabase (if chat_id)
+        ├─ Retrieve chat history from SQLite (if chat_id)
         │   └─ Window: first 4 + last 4 messages (≤8 total)
         │
         ▼
-LangChain AgentExecutor
+LangChain AgentExecutor  (Ollama llama3.1:8b, temp=0, max_iterations=4)
         │
         ├─── AgentLLM decides which tools to call
         │
         ├─── WeatherTool (weather/climate questions)
-        │         └─ City daily cache (<2ms if warm)
+        │         └─ City daily cache (<2 ms if warm)
+        │             Air temp, or ground-temp fallback if no air sensor
         │             Return: today + 7-day + 30-day summaries
         │
         ├─── AgriKnowledgeBase (agronomic questions)
-        │         └─ retriever_llm (temp=0) generates 3 sub-queries
-        │             → Pinecone vector search (k=3 each)
-        │             → Return chunks labelled as authoritative reference
-        │             → Retry once with different keywords if no results
+        │         └─ LLM expands question → 3 English sub-queries
+        │             → FAISS vector search (k=4 each) + verbatim query
+        │             → dedupe, drop junk, return top chunks as reference
         │
         └─── AgentLLM synthesises final Hebrew response
                 │
-                ▼
-        Save user + bot messages to Supabase (if chat_id)
+                ├─ Safety net: if a spurious refusal is detected,
+                │   re-synthesise directly from the collected tool data
                 │
                 ▼
-        Return JSON:
-        {
-          "status": "ok",
-          "error": null,
-          "response": "...",   ← Hebrew answer
-          "steps": [           ← one entry per tool call / LLM step
-            {"module": "WeatherTool",      "prompt": "...", "response": "..."},
-            {"module": "AgriKnowledgeBase","prompt": "...", "response": "..."},
-            {"module": "AgentLLM",         "prompt": "...", "response": "..."}
-          ]
-        }
+        Save user + bot messages to SQLite (if chat_id)
+                │
+                ▼
+        Return JSON { status, error, response, steps[] }
 ```
 
 ---
 
-## Setup on Render
+## Setup (Local)
 
 ### Prerequisites
-- [Render](https://render.com) account
-- [Supabase](https://supabase.com) project with the tables below
-- [Pinecone](https://pinecone.io) project with an `agri-advisor` index (dimension 384, cosine)
-- An OpenAI-compatible LLM API key (project uses [llmod.ai](https://llmod.ai))
+- [Ollama](https://ollama.com) installed and running (`ollama serve`)
+- Python 3.11+
 
-### 1. Supabase tables
-
-```sql
-CREATE TABLE IF NOT EXISTS chats (
-    chat_id TEXT PRIMARY KEY,
-    user_name TEXT,
-    title TEXT
-);
-CREATE TABLE IF NOT EXISTS messages (
-    id BIGSERIAL PRIMARY KEY,
-    chat_id TEXT,
-    role TEXT,
-    content TEXT
-);
-ALTER TABLE chats DISABLE ROW LEVEL SECURITY;
-ALTER TABLE messages DISABLE ROW LEVEL SECURITY;
+### 1. Pull the models
+```bash
+ollama pull llama3.1:8b          # main agent + Hebrew answers
+ollama pull llama3.2             # fast English query-expansion
+ollama pull nomic-embed-text     # embeddings
 ```
 
-### 2. Render web service
-
-1. Create a new **Web Service** and connect this repository.
-2. Set environment variables in the Render dashboard:
-
-| Variable | Value |
-|---|---|
-| `LLMOD_API_KEY` | Your LLM API key |
-| `LLMOD_API_BASE` | `https://api.llmod.ai/v1` (or your endpoint) |
-| `SUPABASE_URL` | Your Supabase project URL |
-| `SUPABASE_KEY` | Your Supabase anon/service key |
-| `PINECONE_API_KEY` | Your Pinecone API key |
-| `PINECONE_INDEX_NAME` | `agri-advisor` |
-
-3. Render will use `render.yaml` automatically.
-4. On first deploy, PDFs are indexed into Pinecone (one-time, ~2–5 minutes). Subsequent deploys skip this.
-
-### 3. Populate Pinecone locally (recommended)
-
+### 2. Install dependencies
 ```bash
 pip install -r requirements.txt
-# set env vars in .env, then run build_index() from main.py
 ```
 
-Or deploy and wait — the agent responds normally while indexing runs in the background.
+### 3. Run
+```bash
+python main.py            # serves on http://localhost:8000
+```
+
+On first run, `rag_service.build_or_load` extracts the PDFs, filters boilerplate, embeds the chunks with `nomic-embed-text`, and saves the FAISS index to `faiss_nomic_index/` (one-time, ~2–3 minutes). Subsequent runs load the saved index instantly. The SQLite chat store (`agri_advisor.db`) is created automatically.
+
+### Optional environment variables
+| Variable | Default | Purpose |
+|---|---|---|
+| `OLLAMA_AGENT_MODEL` | `llama3.1:8b` | Main tool-calling agent |
+| `OLLAMA_RETRIEVER_MODEL` | `llama3.1:8b` | Hebrew→English query expansion |
+| `OLLAMA_EMBED_MODEL` | `nomic-embed-text` | Embeddings |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server URL |
+| `PORT` | `8000` | HTTP port |
+
+---
+
+## Files
+
+| File | Role |
+|---|---|
+| `main.py` | FastAPI app, agent setup, endpoints, refusal safety net |
+| `rag_service.py` | FAISS index build/load, junk filter, Hebrew→English retriever |
+| `weather_service.py` | City weather aggregation with ground-temp fallback |
+| `db_service.py` | Local SQLite chat store |
+| `generate_architecture.py` | Regenerates `static/architecture.png` |
+| `test_project.py` | Test suite |

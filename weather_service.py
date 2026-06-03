@@ -52,8 +52,13 @@ class WeatherService:
             cols = set(df.columns)
 
             if 'TD'   in cols: agg.update({'TD_avg': ('TD', 'mean'), 'TD_max': ('TD', 'max'), 'TD_min': ('TD', 'min')})
+            # TG = ground/grass temperature. Some stations (e.g. Beer Sheva) report
+            # ONLY TG and never air temperature (TD); keep it as a labelled fallback.
+            if 'TG'   in cols: agg.update({'TG_avg': ('TG', 'mean'), 'TG_max': ('TG', 'max'), 'TG_min': ('TG', 'min')})
             if 'RH'   in cols: agg['RH_avg']       = ('RH',   'mean')
-            if 'Rain' in cols: agg['Rain_total']    = ('Rain', 'sum')
+            # min_count=1 → stays NaN (→ "N/A") if the station never reports rain,
+            # instead of a misleading 0.0 mm.
+            if 'Rain' in cols: agg['Rain_total']    = ('Rain', lambda s: s.sum(min_count=1))
             if 'WS'   in cols: agg.update({'WS_avg': ('WS', 'mean'), 'WS_max': ('WS', 'max')})
             if 'WD'   in cols: agg['WD_avg']        = ('WD',   'mean')
             if 'STDwd' in cols: agg['STDwd_avg']    = ('STDwd','mean')
@@ -204,45 +209,83 @@ class WeatherService:
         prev7  = daily[(daily['date'] >= target - pd.Timedelta(days=7))  & (daily['date'] < target)]
         prev30 = daily[(daily['date'] >= target - pd.Timedelta(days=30)) & (daily['date'] < target)]
 
-        def _val(row, key, unit=""):
+        def _has(row, key):
             v = row.get(key)
-            if v is None or (isinstance(v, float) and pd.isna(v)):
+            return not (v is None or (isinstance(v, float) and pd.isna(v)))
+
+        def _val(row, key, unit=""):
+            if not _has(row, key):
                 return "N/A"
-            return f"{v}{unit}"
+            return f"{row.get(key)}{unit}"
+
+        # Temperature line: prefer air temp (TD); if the station only reports ground
+        # temperature (TG) — as Beer Sheva does — fall back to it with a clear label
+        # instead of showing N/A across the board.
+        if _has(today, 'TD_avg'):
+            temp_line = (f"  Air temperature : avg {_val(today,'TD_avg','°C')}  "
+                         f"max {_val(today,'TD_max','°C')}  min {_val(today,'TD_min','°C')}")
+        elif _has(today, 'TG_avg'):
+            temp_line = (f"  Ground temperature (station has no air-temp sensor) : "
+                         f"avg {_val(today,'TG_avg','°C')}  max {_val(today,'TG_max','°C')}  "
+                         f"min {_val(today,'TG_min','°C')}")
+        else:
+            temp_line = "  Temperature : N/A (not reported by this station)"
 
         lines = [
-            "!!! CRITICAL INSTRUCTION: TREAT THIS DATE AS 'TODAY' FOR ALL ADVICE !!!",
+            "REAL MEASURED WEATHER DATA (treat this reference date as 'today' for advice):",
             f"Location: {matched_key}  |  Reference date: {actual_date}",
             "",
             "── TODAY'S CONDITIONS ──────────────────────────────",
-            f"  Temperature : avg {_val(today,'TD_avg','°C')}  max {_val(today,'TD_max','°C')}  min {_val(today,'TD_min','°C')}",
+            temp_line,
             f"  Humidity    : {_val(today,'RH_avg','%')}",
             f"  Rainfall    : {_val(today,'Rain_total',' mm')}",
             f"  Wind        : avg {_val(today,'WS_avg',' m/s')}  max {_val(today,'WS_max',' m/s')}  direction {_val(today,'WD_avg','°')}",
         ]
 
+        def _temp_summary(window):
+            """Avg/max/min temp line, falling back to ground temp (TG) if no air temp."""
+            if 'TD_avg' in window.columns and window['TD_avg'].notna().any():
+                return (f"  Avg air temp: {window['TD_avg'].mean():.1f}°C  "
+                        f"(max {window['TD_max'].max():.1f}°C  min {window['TD_min'].min():.1f}°C)")
+            if 'TG_avg' in window.columns and window['TG_avg'].notna().any():
+                return (f"  Avg ground temp: {window['TG_avg'].mean():.1f}°C  "
+                        f"(max {window['TG_max'].max():.1f}°C  min {window['TG_min'].min():.1f}°C)  [no air-temp sensor]")
+            return ""
+
+        def _frost(window):
+            col = 'TD_min' if 'TD_min' in window.columns else ('TG_min' if 'TG_min' in window.columns else None)
+            return int((window[col] < 0).sum()) if col else 'N/A'
+
+        def _mean_pct(window, col):
+            if col in window.columns and window[col].notna().any():
+                return f"  Avg humidity: {window[col].mean():.0f}%"
+            return ""
+
+        def _rain(window):
+            if 'Rain_total' in window.columns and window['Rain_total'].notna().any():
+                return f"  Total rain  : {window['Rain_total'].sum():.1f} mm"
+            return ""
+
         if len(prev7) > 0:
             n7 = len(prev7)
-            frost7 = int((prev7['TD_min'] < 0).sum()) if 'TD_min' in prev7.columns else 'N/A'
             lines += [
                 "",
                 f"── PAST {n7} DAYS (up to {actual_date}) ──────────────────────",
-                f"  Avg temp    : {prev7['TD_avg'].mean():.1f}°C  (max {prev7['TD_max'].max():.1f}°C  min {prev7['TD_min'].min():.1f}°C)" if 'TD_avg' in prev7.columns else "",
-                f"  Total rain  : {prev7['Rain_total'].sum():.1f} mm" if 'Rain_total' in prev7.columns else "",
-                f"  Avg humidity: {prev7['RH_avg'].mean():.0f}%" if 'RH_avg' in prev7.columns else "",
-                f"  Frost days  : {frost7}",
+                _temp_summary(prev7),
+                _rain(prev7),
+                _mean_pct(prev7, 'RH_avg'),
+                f"  Frost days  : {_frost(prev7)}",
             ]
 
         if len(prev30) > len(prev7) + 3:  # only add 30-day if it meaningfully extends the 7-day window
             n30 = len(prev30)
-            frost30 = int((prev30['TD_min'] < 0).sum()) if 'TD_min' in prev30.columns else 'N/A'
             lines += [
                 "",
                 f"── PAST {n30} DAYS (up to {actual_date}) ──────────────────────",
-                f"  Avg temp    : {prev30['TD_avg'].mean():.1f}°C  (max {prev30['TD_max'].max():.1f}°C  min {prev30['TD_min'].min():.1f}°C)" if 'TD_avg' in prev30.columns else "",
-                f"  Total rain  : {prev30['Rain_total'].sum():.1f} mm" if 'Rain_total' in prev30.columns else "",
-                f"  Avg humidity: {prev30['RH_avg'].mean():.0f}%" if 'RH_avg' in prev30.columns else "",
-                f"  Frost days  : {frost30}",
+                _temp_summary(prev30),
+                _rain(prev30),
+                _mean_pct(prev30, 'RH_avg'),
+                f"  Frost days  : {_frost(prev30)}",
             ]
 
         lines += [

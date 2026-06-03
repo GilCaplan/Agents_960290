@@ -1,14 +1,11 @@
 fastapi
 uvicorn
 langchain
-langchain-openai
-langchain-community
 langchain-classic
-langchain-pinecone
+langchain-community
+langchain-ollama
 langchain-text-splitters
-fastembed
-pinecone
-supabase
+faiss-cpu
 PyMuPDF
 pandas
 pydantic

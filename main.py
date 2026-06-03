@@ -1,9 +1,6 @@
 import os
-import glob
-import fitz
 import json
 import logging
-import time
 import threading
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
@@ -14,29 +11,32 @@ from dotenv import load_dotenv
 from typing import Optional
 
 # --- LangChain & Agent Imports ---
-from langchain_openai import ChatOpenAI
+from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_classic.agents import AgentExecutor, create_openai_tools_agent
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_classic.tools import Tool
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.callbacks import BaseCallbackHandler
 
-# --- RAG Imports ---
-from langchain_pinecone import PineconeVectorStore
-from langchain_community.embeddings import FastEmbedEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.documents import Document
-from langchain_classic.retrievers.multi_query import MultiQueryRetriever
-
-# --- Supabase & Pinecone ---
-from supabase import create_client
-from pinecone import Pinecone, ServerlessSpec
-
+# --- Local RAG + chat store (no external API keys required) ---
+import rag_service
+import db_service
 from weather_service import WeatherService
 
 load_dotenv()
 
 logging.getLogger("langchain.retrievers.multi_query").setLevel(logging.INFO)
+
+# --- Local model configuration (Ollama) ---
+# Override via env vars if you have larger/different local models pulled.
+AGENT_MODEL = os.getenv("OLLAMA_AGENT_MODEL", "llama3.1:8b")        # tool-calling main agent
+# Query expansion only needs to emit a few short ENGLISH search strings, which the
+# fast 3B model handles well — and we also search the verbatim query as a safety net,
+# so an occasional imperfect expansion does not hurt recall. (The 3B model is NOT used
+# for the Hebrew answer itself, where it degenerates — that stays on the 8B model.)
+RETRIEVER_MODEL = os.getenv("OLLAMA_RETRIEVER_MODEL", "llama3.2:latest")
+EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+OLLAMA_BASE = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
 # --- Prompt injection & character guard (injected into system prompt) ---
 SAFETY_INSTRUCTIONS = (
@@ -48,146 +48,169 @@ SAFETY_INSTRUCTIONS = (
 )
 
 # --- Globals initialised in lifespan (after port is bound) ---
-_supabase = None
+_db_ready = False
 _agent_executor = None
 _advanced_retriever = None
+_agent_llm = None          # raw LLM, reused by the refusal safety net
+_weather_service = None     # exposed for the deterministic fallback
 current_active_date = "2025-01-01"
 
+# Phrases that signal the agent failed to produce a grounded answer even though
+# data is available — either a spurious refusal, or the executor's loop-limit / parse
+# fallback message (which is English and unhelpful to the user).
+_REFUSAL_MARKERS = ("לא נמצא מידע", "לא נמצאו מידע", "לא נמצאו תוצאות",
+                    "לא נמצאו מידעים", "אין מידע רלוונטי", "לא נמצא מידע במאגר",
+                    "no results", "NO RESULTS",
+                    "agent stopped", "max iterations", "stopped due to",
+                    "unable to", "i don't have", "i cannot")
 
-# --- Supabase helpers ---
+# Keywords that mark a weather/irrigation question (used by the fallback router).
+_WEATHER_KEYWORDS = ("מזג", "טמפרטור", "חום", "גשם", "להשק", "השקי", "רוח", "לחות",
+                     "קפאון", "מזג אוויר", "weather", "temperature", "rain", "irrigat")
+
+
+def _synthesize_from_tools(user_prompt: str, tool_outputs) -> str:
+    """
+    Synthesise a grounded Hebrew answer directly from tool data. The local 8B model
+    is reliable when the data is supplied as plain context (unlike the flaky agent
+    tool-message scratchpad), so this both repairs spurious refusals and powers the
+    deterministic fallback below.
+    """
+    blocks = "\n\n".join(f"[{mod}]\n{out}" for mod, out in tool_outputs)
+    prompt = (
+        "אתה אגרונום מומחה בישראל. ענה בעברית על השאלה, על בסיס הנתונים הבאים בלבד. "
+        "כלול את כל הפרטים המעשיים שמופיעים בנתונים (סוגי חומרים, יתרונות, פעולות מומלצות), "
+        "אך אל תוסיף שום מספר, מינון, שם חומר כימי, זן או עובדה שאינם כתובים במפורש בנתונים. "
+        "אם פרט אינו מופיע — אל תכלול אותו. "
+        "אם יש נתוני מזג אוויר — תן המלצה מעשית (למשל לגבי השקיה) על בסיסם. "
+        "הסבר ראשי תיבות מקצועיים בסוגריים בפעם הראשונה.\n\n"
+        f"שאלת המשתמש: {user_prompt}\n\n"
+        f"נתונים מהכלים:\n{blocks}\n\nתשובתך בעברית:"
+    )
+    resp = _agent_llm.invoke(prompt)
+    return resp.content if hasattr(resp, "content") else str(resp)
+
+
+def _gather_tools_deterministically(user_prompt: str, city: str, date: str):
+    """
+    Directly call the relevant tools without relying on the agent's tool-loop.
+    Returns a list of (module, output). Used as a reliability fallback for the
+    local 8B model, which sometimes refuses instead of calling tools.
+    """
+    outs = []
+    is_weather = city or any(k in user_prompt.lower() for k in _WEATHER_KEYWORDS)
+    if is_weather and city and _weather_service is not None:
+        try:
+            outs.append(("WeatherTool", _weather_service.get_weather(f"{city} on {date}")))
+        except Exception as e:
+            print(f"[Fallback] weather lookup failed: {e}")
+    if _advanced_retriever is not None:
+        try:
+            rag = _advanced_retriever.search(user_prompt)
+            if rag and "NO RESULTS" not in rag:
+                outs.append(("AgriKnowledgeBase", rag))
+        except Exception as e:
+            print(f"[Fallback] RAG search failed: {e}")
+    return [(m, o) for m, o in outs if o and not o.startswith("Error")]
+
+
+def _is_refusal(answer: str) -> bool:
+    low = answer.lower()
+    return len(answer.strip()) < 15 or any(m.lower() in low for m in _REFUSAL_MARKERS)
+
+
+def _finalize_answer(agent_answer, user_prompt, tool_outputs, city="", date="") -> str:
+    """
+    Recover from the local model's occasional failures without touching good answers.
+
+    The agent grounds its own answers correctly when it works (verified: specifics
+    like gypsum dosages trace to real corpus chunks, not hallucination). So we only
+    intervene on a *spurious* refusal — the model returning "no information" / hitting
+    the loop limit even though a tool returned real data. We then re-synthesise from
+    that data, gathering it deterministically if the agent failed to call the tool.
+
+    Legitimate off-topic refusals (Hebrew "this isn't an agricultural topic") do NOT
+    match the refusal markers, so they are left untouched.
+    """
+    if _agent_llm is None or not _is_refusal(agent_answer):
+        return agent_answer
+
+    substantive = [(m, o) for m, o in (tool_outputs or [])
+                   if o and "NO RESULTS" not in o and not o.startswith("Error")]
+    if not substantive:
+        substantive = _gather_tools_deterministically(user_prompt, city, date)
+    if not substantive:
+        return agent_answer   # genuinely nothing to ground on — keep the refusal
+
+    print("[Repair] Spurious refusal detected — re-synthesising from tool data.")
+    return _synthesize_from_tools(user_prompt, substantive)
+
+
+# --- Chat-store helpers (local SQLite, see db_service.py) ---
 def db_get_chat(chat_id: str):
-    res = _supabase.table("chats").select("chat_id").eq("chat_id", chat_id).execute()
-    return res.data[0] if res.data else None
+    return db_service.get_chat(chat_id)
 
 
 def db_create_chat(chat_id: str, user_name: str, title: str):
-    _supabase.table("chats").insert(
-        {"chat_id": chat_id, "user_name": user_name, "title": title}
-    ).execute()
+    db_service.create_chat(chat_id, user_name, title)
 
 
 def db_get_history(chat_id: str):
-    res = _supabase.table("messages").select("role, content").eq("chat_id", chat_id).order("id").execute()
-    return res.data
+    return db_service.get_history(chat_id)
 
 
 def db_save_messages(chat_id: str, user_msg: str, bot_msg: str):
-    _supabase.table("messages").insert([
-        {"chat_id": chat_id, "role": "user", "content": user_msg},
-        {"chat_id": chat_id, "role": "bot",  "content": bot_msg},
-    ]).execute()
+    db_service.save_messages(chat_id, user_msg, bot_msg)
 
 
 def db_get_user_chats(user_name: str):
-    res = _supabase.table("chats").select("chat_id, title").eq("user_name", user_name).execute()
-    return res.data
+    return db_service.get_user_chats(user_name)
 
 
 def db_delete_chat(chat_id: str):
-    _supabase.table("messages").delete().eq("chat_id", chat_id).execute()
-    _supabase.table("chats").delete().eq("chat_id", chat_id).execute()
-
-
-# --- Pinecone / RAG setup ---
-PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "agri-advisor")
-
-
-def build_index(embeddings):
-    pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
-    existing = [idx.name for idx in pc.list_indexes()]
-
-    if PINECONE_INDEX_NAME not in existing:
-        print(f"[Pinecone] Creating index '{PINECONE_INDEX_NAME}'...")
-        pc.create_index(
-            name=PINECONE_INDEX_NAME,
-            dimension=384,
-            metric="cosine",
-            spec=ServerlessSpec(cloud="aws", region="us-east-1")
-        )
-        time.sleep(5)
-
-    index = pc.Index(PINECONE_INDEX_NAME)
-    vs = PineconeVectorStore(index=index, embedding=embeddings)
-
-    stats = index.describe_index_stats()
-    total_vectors = stats.total_vector_count
-
-    if total_vectors == 0:
-        print("[Pinecone] Index empty — indexing PDFs...")
-        pdf_files = glob.glob("project_sources/*.pdf")
-        docs_list = []
-        for pdf in pdf_files:
-            doc = fitz.open(pdf)
-            for page in doc:
-                text = page.get_text()
-                if text.strip():
-                    docs_list.append(Document(
-                        page_content=text,
-                        metadata={"source": os.path.basename(pdf)}
-                    ))
-            doc.close()
-        if docs_list:
-            chunks = RecursiveCharacterTextSplitter(
-                chunk_size=1000, chunk_overlap=200
-            ).split_documents(docs_list)
-            vs.add_documents(chunks)
-            print(f"[Pinecone] Indexed {len(chunks)} chunks.")
-    else:
-        print(f"[Pinecone] Index ready — {total_vectors} vectors.")
-
-    return vs
+    db_service.delete_chat(chat_id)
 
 
 # --- Heavy initialisation (runs in background thread after port is bound) ---
 def _init_services():
-    global _supabase, _agent_executor, _advanced_retriever
+    global _db_ready, _agent_executor, _advanced_retriever, _agent_llm
     try:
-        print("[Init] Connecting to Supabase...")
-        _supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
+        print("[Init] Initialising local SQLite chat store...")
+        db_service.init_db()
+        _db_ready = True
 
-        print("[Init] Loading LLM...")
-        llm = ChatOpenAI(
-            api_key=os.getenv("LLMOD_API_KEY"),
-            base_url=os.getenv("LLMOD_API_BASE", "https://api.llmod.ai/v1"),
-            model="RPRTHPB-gpt-5-mini",
-            temperature=1,
-            streaming=True
-        )
+        print(f"[Init] Loading local LLM '{AGENT_MODEL}' via Ollama...")
+        # Local tool-calling agent. temperature kept low for grounded, deterministic
+        # agronomic advice. No API key required.
+        # num_predict caps answer length (the local model otherwise writes very long
+        # Hebrew answers → tens of seconds); num_ctx fits the system prompt + tool data.
+        llm = ChatOllama(model=AGENT_MODEL, base_url=OLLAMA_BASE, temperature=0,
+                         num_predict=450, num_ctx=4096)
+        _agent_llm = llm
 
-        # Separate lightweight LLM for MultiQueryRetriever sub-query generation.
-        # streaming=False → no overhead. temperature=1 required by this model endpoint.
-        # Swap model name here for a cheaper/smaller model if available on the endpoint.
-        retriever_llm = ChatOpenAI(
-            api_key=os.getenv("LLMOD_API_KEY"),
-            base_url=os.getenv("LLMOD_API_BASE", "https://api.llmod.ai/v1"),
-            model="RPRTHPB-gpt-5-mini",
-            temperature=1,
-            streaming=False
-        )
+        # Same model reused for Hebrew→English query expansion (see RETRIEVER_MODEL).
+        # Expansion output is short, so cap it tightly for speed.
+        retriever_llm = ChatOllama(model=RETRIEVER_MODEL, base_url=OLLAMA_BASE,
+                                   temperature=0, num_predict=80, num_ctx=1024)
 
-        print("[Init] Loading embeddings model...")
-        embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
-
-        print("[Init] Connecting to Pinecone...")
-        vectorstore = build_index(embeddings)
+        print(f"[Init] Loading embeddings '{EMBED_MODEL}' and FAISS index...")
+        # Wrap with nomic task prefixes (search_document/search_query) for correct retrieval.
+        embeddings = rag_service.NomicPrefixedEmbeddings(
+            OllamaEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_BASE))
+        vectorstore = rag_service.build_or_load(embeddings)
 
         if vectorstore:
-            _advanced_retriever = MultiQueryRetriever.from_llm(
-                retriever=vectorstore.as_retriever(search_kwargs={"k": 3}),
-                llm=retriever_llm
-            )
+            _advanced_retriever = rag_service.AgriRetriever(vectorstore, retriever_llm)
 
+        global _weather_service
         weather_service = WeatherService()
+        _weather_service = weather_service
 
         def search_pdf(query: str):
             if not _advanced_retriever:
                 return "Error: No professional documents found in the system."
             print(f"\n[RAG DEBUG] Advanced RAG Search: '{query}'")
-            docs = _advanced_retriever.invoke(query)
-            if not docs:
-                return "NO RESULTS FOUND in the knowledge base. Try once more with different, broader agricultural keywords."
-            header = "=== AGRICULTURAL KNOWLEDGE BASE — AUTHORITATIVE REFERENCE MATERIAL ===\n"
-            return header + "\n\n---\n\n".join([d.page_content for d in docs])
+            return _advanced_retriever.search(query)
 
         def weather_tool_wrapper(city_input: str):
             clean_city = str(city_input).replace("on", "").replace(current_active_date, "").strip()
@@ -199,15 +222,21 @@ def _init_services():
         ]
 
         prompt = ChatPromptTemplate.from_messages([
-            ("system", f"""אתה אגרונום מומחה בישראל. אתה עונה אך ורק על שאלות הקשורות לחקלאות, גידולים, קרקע, השקיה, מזג אוויר חקלאי, מחלות צמחים וניהול שדות.
-    1. אם השאלה עוסקת בברכות, תודות או שיחה חברתית קצרה — ענה בנימוס קצר בעברית ללא שימוש בכלים. אם הנושא אינו קשור לחקלאות בשום אופן (למשל: בעלי חיים כחיות מחמד, בישול, פוליטיקה, טכנולוגיה) — ענה בנימוס שאינך יכול לסייע בנושא זה. במקרה של ספק — התייחס לשאלה כחקלאית ונסה לחפש במאגר הידע.
-    2. בשאלות מקצועיות הקשורות למזג אוויר: חובה להשתמש בכלי 'weather_lookup'.
-    3. ההקשר הנסתר שמועבר אליך מכיל את התאריך ("היום") והמיקום.
-    4. חובה להשתמש בכלי 'agri_knowledge_base' לכל שאלה חקלאית. בסס את תשובתך אך ורק על המידע שמוחזר מהכלי — אל תוסיף ידע כללי שאינו מהמקורות. אם הכלי מחזיר NO RESULTS, נסה בדיוק פעם אחת נוספת עם מילות מפתח שונות ורחבות יותר — לאחר הניסיון השני, ציין שלא נמצא מידע רלוונטי במאגר.
-    5. ענה בעברית בלבד ובצורה מקצועית. התאם את רמת הפירוט ואורך התשובה לאופי השאלה — שאלה קצרה/כללית מקבלת תשובה תמציתית, שאלה טכנית ומפורטת מקבלת תשובה מעמיקה.
-    6. כאשר אתה משתמש במונחים מקצועיים או ראשי תיבות (כגון GAP, ETc, VPD וכד'), הסבר אותם בקצרה בסוגריים בפעם הראשונה שהם מופיעים בתשובה. לדוגמה: "נהלי GAP (Good Agricultural Practices — נהלים חקלאיים טובים)".
-    7. אם לא סופק מיקום בהקשר הנסתר, אל תניח מיקום ספציפי בתשובתך ואל תמליץ על פי אזור שאינו ידוע.
-    8. {SAFETY_INSTRUCTIONS}"""),
+            ("system", f"""אתה אגרונום מומחה בישראל. אתה עונה אך ורק על שאלות הקשורות לחקלאות, גידולים, קרקע, השקיה, מזג אוויר חקלאי, מחלות צמחים וניהול שדות. ענה תמיד בעברית בלבד.
+
+בחירת כלים:
+    1. שאלה על מזג אוויר, טמפרטורה, גשם או השקיה לפי תנאי מזג האוויר — השתמש בכלי 'weather_lookup'.
+    2. שאלה חקלאית מקצועית (קרקע, גידולים, מחלות, דישון, עיבוד) — השתמש בכלי 'agri_knowledge_base'. אם הכלי מחזיר NO RESULTS, נסה פעם אחת נוספת עם מילות מפתח רחבות יותר.
+    3. שאלות שמשלבות מזג אוויר ופעולה חקלאית (למשל "האם כדאי להשקות היום?") — השתמש ב'weather_lookup' לקבלת הנתונים, ואם צריך גם ב'agri_knowledge_base'.
+    4. ברכה/תודה/שיחה חברתית קצרה — ענה בקצרה ובנימוס ללא כלים. נושא שאינו חקלאי כלל (בישול, פוליטיקה, טכנולוגיה, חיות מחמד) — ענה בנימוס שאינך יכול לסייע, ללא כלים.
+
+ניסוח התשובה:
+    5. חשוב מאוד: בסס את תשובתך על הנתונים שהכלים החזירו בפועל. אם 'weather_lookup' החזיר נתוני מזג אוויר — אתה חייב להשתמש בהם ולתת המלצה (למשל לגבי השקיה) על בסיסם. לעולם אל תכתוב "לא נמצא מידע" או "לא נמצאו תוצאות" כאשר כלי כלשהו כבר החזיר נתונים — זו טעות חמורה.
+    6. אמור "לא נמצא מידע רלוונטי במאגר" אך ורק במצב שבו 'agri_knowledge_base' החזיר NO RESULTS גם בניסיון השני וגם אין נתוני מזג אוויר. אם יש נתוני מזג אוויר — ענה לפיהם.
+    7. כשמסתמכים על המאגר החקלאי — בסס את התוכן אך ורק על המקורות שהוחזרו. אסור בהחלט להמציא מספרים, מינונים, שמות חומרים כימיים, זנים או עובדות שאינם מופיעים במפורש במקורות. אם פרט מסוים אינו מופיע במקורות — אל תכלול אותו. עדיף לכתוב תשובה כללית יותר מאשר להוסיף נתון שאינו מבוסס. ההקשר הנסתר מכיל את התאריך ("היום") והמיקום.
+    8. התאם את אורך התשובה לשאלה: שאלה כללית — תשובה תמציתית; שאלה טכנית — תשובה מעמיקה. הסבר ראשי תיבות מקצועיים בסוגריים בפעם הראשונה (למשל: "GAP (Good Agricultural Practices — נהלים חקלאיים טובים)").
+    9. אם לא סופק מיקום, אל תניח מיקום ספציפי ואל תמליץ לפי אזור שאינו ידוע.
+    10. {SAFETY_INSTRUCTIONS}"""),
             MessagesPlaceholder(variable_name="chat_history"),
             ("human", "{input}"),
             MessagesPlaceholder(variable_name="agent_scratchpad"),
@@ -216,7 +245,9 @@ def _init_services():
         _agent_executor = AgentExecutor(
             agent=create_openai_tools_agent(llm, tools, prompt),
             tools=tools,
-            verbose=False
+            verbose=False,
+            max_iterations=4,              # bound tool-loop latency on the local model
+            handle_parsing_errors=True,
         )
         print("[Init] Agent ready ✓")
 
@@ -241,6 +272,7 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 class StepsCallbackHandler(BaseCallbackHandler):
     def __init__(self):
         self.steps = []
+        self.tool_outputs = []   # (module, full_output) — used by the refusal safety net
         self._pending_tool = None
         self._pending_llm_prompt = None
 
@@ -283,6 +315,7 @@ class StepsCallbackHandler(BaseCallbackHandler):
 
     def on_tool_end(self, output, **kwargs):
         if self._pending_tool:
+            self.tool_outputs.append((self._pending_tool["module"], str(output)))
             self.steps.append({
                 "module": self._pending_tool["module"],
                 "prompt": self._pending_tool["prompt"],
@@ -319,7 +352,7 @@ async def execute(req: ExecuteRequest):
     if req.date:
         current_active_date = req.date
 
-    if _agent_executor is None or _supabase is None:
+    if _agent_executor is None or not _db_ready:
         return {"status": "error", "error": "Agent is still initialising, please try again in a moment.", "response": None, "steps": []}
 
     full_input = req.prompt
@@ -347,6 +380,10 @@ async def execute(req: ExecuteRequest):
             config={"callbacks": [handler]}
         )
         answer = result.get("output", "")
+        # Ground knowledge-base answers in the retrieved sources, and recover from
+        # spurious refusals — both via a controlled re-synthesis from real tool data.
+        answer = _finalize_answer(answer, req.prompt, handler.tool_outputs,
+                                  city=req.city or "", date=req.date or current_active_date)
         if req.chat_id:
             db_save_messages(req.chat_id, req.prompt, answer)
         return {"status": "ok", "error": None, "response": answer, "steps": handler.steps}
@@ -384,16 +421,16 @@ async def agent_info():
         },
         "prompt_examples": [
             {
-                "prompt": "מה הטמפרטורה היום בבאר שבע והאם כדאי להשקות?",
+                "prompt": "מה מצב מזג האוויר בבאר שבע והאם כדאי להשקות?",
                 "full_response": (
-                    "הטמפרטורה היום בבאר שבע היא 34°C עם לחות של 22%. "
-                    "מומלץ להשקות בשעות הבוקר המוקדמות (05:00–07:00) כדי למזער אידוי. "
-                    "כמות מים מומלצת: 6–8 מ\"מ לטפטוף."
+                    "תחנת באר שבע מודדת טמפרטורת קרקע בלבד (ללא חיישן טמפרטורת אוויר, לחות או רוח). "
+                    "טמפרטורת הקרקע הממוצעת היום היא כ-13°C ללא משקעים. "
+                    "בתנאים אלו, בעונה החורפית, אין צורך מיידי בהשקיה."
                 ),
                 "steps": [
-                    {"module": "WeatherTool",      "prompt": {"city": "beer sheva", "date": "2025-07-01"}, "response": {"temp": "34°C", "humidity": "22%", "rain": "0mm"}},
-                    {"module": "AgriKnowledgeBase", "prompt": {"query": "irrigation high temperature dry conditions"}, "response": {"excerpt": "Irrigate in early morning to minimize evaporation..."}},
-                    {"module": "AgentLLM",          "prompt": {"context": "weather + rag results"}, "response": {"answer": "השקה בבוקר מוקדם, 6–8 מ\"מ"}}
+                    {"module": "WeatherTool",      "prompt": {"city": "beer sheva", "date": "2025-01-15"}, "response": {"ground_temp": "12.9°C", "humidity": "N/A", "rain": "N/A"}},
+                    {"module": "AgriKnowledgeBase", "prompt": {"query": "irrigation scheduling soil moisture cool season"}, "response": {"excerpt": "Irrigate based on soil moisture and evapotranspiration..."}},
+                    {"module": "AgentLLM",          "prompt": {"context": "weather + rag results"}, "response": {"answer": "אין צורך מיידי בהשקיה"}}
                 ]
             },
             {

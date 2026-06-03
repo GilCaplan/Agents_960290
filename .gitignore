@@ -8,3 +8,10 @@
 __pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
+
+# Local FAISS index — rebuilt from project_sources/ on first run
+faiss_nomic_index/
+
+# Stray local artifacts
+architecture_download.png

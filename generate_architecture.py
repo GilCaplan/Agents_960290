@@ -66,30 +66,30 @@ box(ax, 0.3, 4.6, 2.2, 1.7, "FastAPI Server",
 
 # ── AgentExecutor ────────────────────────────────────────────────────────────
 box(ax, 3.5, 4.6, 3.0, 1.7, "AgentExecutor",
-    "LangChain Classic\ncreate_openai_tools_agent\nSteps logger / Callback",
+    "LangChain Classic\ncreate_openai_tools_agent\nSteps logger + refusal safety net",
     C_AGENT, 9)
 
 # ── LLM ─────────────────────────────────────────────────────────────────────
 box(ax, 3.5, 7.1, 3.0, 1.1, "AgentLLM",
-    "LLMod.ai (gpt-5-mini)\nvia OpenAI-compat. API",
+    "Ollama - llama3.1:8b\n(local, no API key)",
     C_LLM, 9)
 
 # ── Tools ────────────────────────────────────────────────────────────────────
 box(ax, 7.5, 6.0, 2.8, 1.3, "WeatherTool",
-    "16 Israeli cities\nDate-aware lookup\nJSON city_data/",
+    "16 Israeli cities\nDate-aware lookup\nground-temp fallback",
     C_TOOL, 9)
 
 box(ax, 7.5, 4.2, 2.8, 1.5, "AgriKnowledgeBase",
-    "MultiQueryRetriever\nretriever_llm (temp=0)\nRAG over PDF manuals",
+    "Hebrew->English query\nexpansion + junk filter\nRAG over PDF manuals",
     C_TOOL, 9)
 
 # ── Databases ────────────────────────────────────────────────────────────────
-box(ax, 11.2, 6.0, 2.4, 1.3, "Supabase\n(PostgreSQL)",
+box(ax, 11.2, 6.0, 2.4, 1.3, "SQLite\n(agri_advisor.db)",
     "Chat sessions\nMessage history",
     C_DB, 9)
 
-box(ax, 11.2, 4.2, 2.4, 1.5, "Pinecone\n(Vector DB)",
-    "PDF chunk embeddings\nBAAI/bge-small-en-v1.5",
+box(ax, 11.2, 4.2, 2.4, 1.5, "FAISS\n(local vector DB)",
+    "PDF chunk embeddings\nnomic-embed-text 768d\nvia Ollama",
     C_VEC, 9)
 
 # ── Arrows ───────────────────────────────────────────────────────────────────

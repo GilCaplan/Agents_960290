@@ -9,9 +9,9 @@ import requests
 import time
 import uuid
 
-# Default to the live Render deployment; override with BASE_URL env var for local testing
+# Default to the local server; override with BASE_URL env var if needed.
 # e.g.  BASE_URL=http://127.0.0.1:8000 python test_project.py
-BASE = os.getenv("BASE_URL", "https://agents-960290.onrender.com")
+BASE = os.getenv("BASE_URL", "http://127.0.0.1:8000")
 RESULTS = []
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -35,7 +35,7 @@ def fail(label, detail=""):
     print(msg)
     RESULTS.append(("FAIL", label))
 
-def post_execute(payload, timeout=90):
+def post_execute(payload, timeout=240):
     """POST to /api/execute and return parsed JSON or None on error."""
     try:
         res = requests.post(f"{BASE}/api/execute", json=payload, timeout=timeout)
